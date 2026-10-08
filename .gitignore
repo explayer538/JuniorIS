@@ -1,0 +1,17 @@
+# macOS metadata
+.DS_Store
+
+# Local Xcode settings and build output
+xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+*.xcarchive
+*.ipa
+
+# Temporary and backup files
+~$*
+*.swp
+*.swo
+*.tmp
+*~
