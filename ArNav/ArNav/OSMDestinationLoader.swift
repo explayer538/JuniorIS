@@ -33,8 +33,13 @@ class OSMDestinationLoader: NSObject, XMLParserDelegate {
     // The current way tags
     private var currentWayTags: [String: String] = [:]
     
+    // The current way Records
+    private(set) var ways: [OSMWay] = []
+    
     // node count
     private(set) var nodeCount = 0
+    
+    private(set) var nodeTags: [String: [String: String]] = [:]
     
     // A callback XML parser calls when an element starts
     func parser(_ parser: XMLParser,
@@ -107,8 +112,8 @@ class OSMDestinationLoader: NSObject, XMLParserDelegate {
             if let name = currentNodeTags["name"],
                let nodeID = currentNodeID {
             
-                print("Named node: ", nodeID, name)
-                print("node tags: ", currentNodeTags)
+                //print("Named node: ", nodeID, name)
+                //print("node tags: ", currentNodeTags)
                 
                 // Get the coordinate using the id
                 if let coordinate = nodeCoordinates[nodeID] {
@@ -123,6 +128,9 @@ class OSMDestinationLoader: NSObject, XMLParserDelegate {
                 
                 
                 
+            }
+            if let nodeID = currentNodeID {
+                nodeTags[nodeID] = currentNodeTags
             }
             
             // set current Node id to null and empty the dictionary
@@ -193,6 +201,18 @@ class OSMDestinationLoader: NSObject, XMLParserDelegate {
                 //print("Coordinates: ", coordinates)
                 
                 
+            }
+            /*
+            if currentWayTags["highway"] == "footway",
+               let wayID = currentWayID {
+                print("Footpath: ", wayID)
+                print("Node references: ", currentWayNodeIDs.count)
+            }
+            */
+            if let wayID = currentWayID {
+                let way = OSMWay(id: wayID, nodeIDs: currentWayNodeIDs, tags: currentWayTags)
+                
+                ways.append(way)
             }
             
             // Set the way ID to null
