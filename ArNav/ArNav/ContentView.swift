@@ -396,6 +396,34 @@ struct ContentView: View {
     
     @State private var arStartLocation: CLLocation? = nil
     
+    @State private var arRouteCoordinates: [CLLocationCoordinate2D] = []
+    
+    @MainActor
+    private func startNavigation(to destination: Destination) async {
+        let granted = await cameraPermissionManager.requestPermission()
+        
+        guard granted else {
+            cameraPermissionMessage = "Camera access is unavailable. Check ArNav’s camera permission in Settings."
+            return
+        }
+        
+        cameraPermissionMessage = nil
+        
+        //Recalculate before entering AR
+        calculateRoute(to: destination)
+        
+        guard selectedRoute != nil,
+                let routeLocation = lastRouteCalculationLocation else {
+            return
+        }
+        
+        //Save the location used for this route calculation
+        arStartLocation = routeLocation
+        arRouteCoordinates = selectedRouteCoordinates
+        isShowingARNavigarion = true
+        
+    }
+    
     var body: some View {
         
         //Allows us to stack different elements on top of each other
@@ -405,7 +433,6 @@ struct ContentView: View {
             Map(initialPosition: .region(campusRegion),
                 selection: $selectedMapDestinationID
             ) {
-                // If we have enough coordinates
                 if selectedRouteCoordinates.count >= 2 {
                     // Draw a line draws from each selected route coordinate
                     MapPolyline(coordinates: selectedRouteCoordinates)
@@ -413,7 +440,6 @@ struct ContentView: View {
                 }
                 UserAnnotation {
                     ZStack {
-                        // if we can get the heading
                         if let heading = locationManger.headingDegrees {
                             // draw the cone changing the size dependong on accuracy
                             HeadingCone(halfAngle: locationManger.headingHalfAngle)
@@ -634,26 +660,7 @@ struct ContentView: View {
                             Button {
                                 // Makes the request run asynchronously
                                 Task {
-                                    let granted = await cameraPermissionManager.requestPermission()
-                                    
-                                    if granted {
-                                        cameraPermissionMessage = nil
-                                        guard let location = locationManger.currentLocation else {
-                                            routeMessage = "Waiting for your locaion. Try to Start again"
-                                            return
-                                        }
-                                        let age = Date().timeIntervalSince(location.timestamp)
-                                        
-                                        guard location.horizontalAccuracy >= 0, age >= -5, age <= 15 else {
-                                            routeMessage = "A recent, accurate location is needed to start AR. Try again shortly."
-                                            return
-                                        }
-                                        
-                                        arStartLocation = location
-                                        isShowingARNavigarion = true
-                                    } else {
-                                        cameraPermissionMessage = "Camera access is unavailable. Check ArNav’s camera permission in Settings."
-                                    }
+                                    await startNavigation(to: destination)
                                 }
                             } label: {
                                 Text("Start")
@@ -839,7 +846,7 @@ struct ContentView: View {
         // changes screen when ar navigation is true
         .fullScreenCover(isPresented: $isShowingARNavigarion) {
             if let destination = selectedDestination, let location = arStartLocation {
-                ARNavigationView(destinationName: destination.name, routeCoordinates: selectedRouteCoordinates, startLocation: location)
+                ARNavigationView(destinationName: destination.name, routeCoordinates: arRouteCoordinates, startLocation: location)
             }
         }
         

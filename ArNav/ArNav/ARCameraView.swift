@@ -120,16 +120,21 @@ struct ARCameraView: UIViewRepresentable {
         // Creates a yellow Sphere
         let marker = ModelEntity(mesh: .generateSphere(radius: radius), materials: [SimpleMaterial(color: .yellow, isMetallic: false)])
         
-        // Increasing so Sphere touches the ground
+        // Changes y position Adds Ball to the scene
         marker.position.y = radius
-        //Positions the Sphere relative to the anchor
         anchor.addChild(marker)
-        // Adds them to the scene
         uiView.scene.addAnchor(anchor)
         
         // Draw if the route offset is Available.
         if let offset = routeStartOffset?.arOffset {
-            let routeStartPosition = SIMD3<Float>(offset.x, point.y, offset.z)
+            guard let frame = uiView.session.currentFrame else {
+                return
+            }
+            
+            let cameraPosition = frame.camera.transform.columns.3
+            
+            let routeStartPosition = SIMD3<Float>(cameraPosition.x, point.y, cameraPosition.z)
+            //let routeStartPosition = SIMD3<Float>(offset.x, point.y, offset.z)
             
             // Anchor for the starting point
             let routeAnchor = AnchorEntity(world: routeStartPosition)
@@ -143,7 +148,6 @@ struct ARCameraView: UIViewRepresentable {
             if let nextPoint = localRoutePoints.first(where: {point in hypot(point.eastMeters, point.northMeters) > 0.01}) {
                 // Offset from start point to this point
                 let offset = nextPoint.arOffset
-                // Horizontal Distance
                 let length = hypot(offset.x, offset.z)
                 
                 //Convert route Direction into compass Bearing, then converting into degrees.
@@ -170,39 +174,45 @@ struct ARCameraView: UIViewRepresentable {
                     }
                 }
                 
-                //Draws at most 2 Meters of a segement, if it is shorter we would use the whole segment
-                // Multiplying by the scale helps preserve direction
-                let scale = min(1, 2/length)
+                let nearbyPoints = nearbyRouteOffset(limitMeters: 5)
                 
-                // Green marker with marks the end of the visible strip
-                let directionMarker = ModelEntity(mesh: .generateSphere(radius: 0.05), materials: [SimpleMaterial(color: .green, isMetallic: false)])
+                //Drawing a strip between the points in the first 5 meters
+                for (start, end) in zip(nearbyPoints, nearbyPoints.dropFirst()) {
+                    
+                    let step = end - start
+                    let segmentLength = hypot(step.x, step.z)
+                    
+                    guard segmentLength > 0 else {continue}
+                    
+                    let strip = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.12,0.01, segmentLength)), materials: [SimpleMaterial(color: .yellow, isMetallic: false)])
+                    
+                    strip.position = SIMD3<Float>((start.x + end.x)/2, 0.015,(start.z + end.z)/2)
+                    
+                    // Rotate strip to match segment direction
+                    let angle = atan2(step.x, step.z)
+                    strip.orientation = simd_quatf(angle: angle, axis: SIMD3<Float>(0,1,0))
+                    
+                    routeAnchor.addChild(strip)
+                }
                 
-                directionMarker.position = SIMD3<Float>(offset.x * scale, 0.05, offset.z * scale)
-                routeAnchor.addChild(directionMarker)
+                if let end = nearbyPoints.last {
+                    let directionMarker = ModelEntity(mesh: .generateSphere(radius: 0.05), materials: [SimpleMaterial(color: .green, isMetallic: false)])
+                    
+                    directionMarker.position = SIMD3<Float>(end.x, 0.05, end.z)
+                    
+                    routeAnchor.addChild(directionMarker)
+                }
                 
-                // Use horizontal position and length at the endpoint of the yellow strip.
-                let endX = offset.x * scale
-                let endZ = offset.z * scale
-                let stripLength = length * scale
-                
-                // Make a flat yellow box: 12 cm wide, 1 cm thick, and long enough
-                let strip = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.12, 0.01, stripLength)), materials: [SimpleMaterial(color: .yellow, isMetallic: false)])
-                
-                // places its center halfway between blue and green, slightly above the ground.
-                strip.position = SIMD3<Float>(endX / 2, 0.015, endZ / 2)
-                
-                
-                // Turn the box from +Z toward green. Rotating around Y (the up axis)
-                // keeps the strip flat. simd_quatf expresses that rotation for RealityKit
-                let angle = atan2(endX, endZ)
-                
-                strip.orientation = simd_quatf(angle: angle, axis: SIMD3<Float>(0, 1, 0))
-                
-                routeAnchor.addChild(strip)
             }
             
             // Add the anchor and all its children to the AR scene together.
             uiView.scene.addAnchor(routeAnchor)
+        }
+        
+        if let startOffset = routeStartOffset {
+            let horizontalDistance = hypot(startOffset.eastMeters, startOffset.northMeters)
+            
+            checkMessage += String(format: "\nStart offset · East: %.1f m · North: %.1f m · Total: %.1f m", startOffset.eastMeters, startOffset.northMeters, horizontalDistance)
         }
         
         Task { @MainActor in
