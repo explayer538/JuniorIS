@@ -25,6 +25,8 @@ struct ARCameraView: UIViewRepresentable {
     
     @Binding var detectedSurfacePoint: SIMD3<Float>?
     
+    @Binding var routeProgressMeters: Float?
+    
     let routeStartOffset: LocalRoutePoint?
     
     
@@ -138,6 +140,15 @@ struct ARCameraView: UIViewRepresentable {
             
             // Anchor for the starting point
             let routeAnchor = AnchorEntity(world: routeStartPosition)
+            
+            let routeDisplay = context.coordinator.routeDisplay
+            
+            for child in Array(routeDisplay.children) {
+                child.removeFromParent()
+            }
+            
+            routeAnchor.addChild(routeDisplay)
+            
             // Creating a Blue marker for the start point and raise the y so it touches the ground
             let routeMarker = ModelEntity(mesh: .generateSphere(radius: 0.05), materials: [SimpleMaterial(color: .blue, isMetallic: false)])
             
@@ -192,7 +203,7 @@ struct ARCameraView: UIViewRepresentable {
                     let angle = atan2(step.x, step.z)
                     strip.orientation = simd_quatf(angle: angle, axis: SIMD3<Float>(0,1,0))
                     
-                    routeAnchor.addChild(strip)
+                    routeDisplay.addChild(strip)
                 }
                 
                 if let end = nearbyPoints.last {
@@ -200,13 +211,24 @@ struct ARCameraView: UIViewRepresentable {
                     
                     directionMarker.position = SIMD3<Float>(end.x, 0.05, end.z)
                     
-                    routeAnchor.addChild(directionMarker)
+                    routeDisplay.addChild(directionMarker)
                 }
                 
             }
             
+            // Remove the previous route if we are placing it again.
+            context.coordinator.routeAnchor?.removeFromParent()
+            
             // Add the anchor and all its children to the AR scene together.
             uiView.scene.addAnchor(routeAnchor)
+            context.coordinator.routeAnchor = routeAnchor
+            
+            // Save the whole route, including points beyond the visible section.
+            context.coordinator.routePoints = localRoutePoints.map { routePoint in
+                routePoint.arOffset
+            }
+            
+            context.coordinator.resetRouteDisplayProgress()
         }
         
         if let startOffset = routeStartOffset {
@@ -231,12 +253,23 @@ struct ARCameraView: UIViewRepresentable {
         // Binding variable that gives use the same message from AR navigation
         private let trackingMessage: Binding<String>
         // Setting class tracking message variable to the one passage in the Coordinator
-        init(trackingMessage: Binding<String>) {
+        init(trackingMessage: Binding<String>, routeProgressMeters: Binding<Float?>) {
             self.trackingMessage = trackingMessage
+            self.routeProgressMeters = routeProgressMeters
         }
         
         var lastSurfaceCheckCount = 0
+        var routeAnchor: AnchorEntity? = nil
+        // Full route positions, measured relative to the route anchor.
+        var routePoints: [SIMD3<Float>] = []
+        var cameraRoutePosition: SIMD3<Float>? = nil
+        private var routeProgressMeters: Binding<Float?>
         
+        let routeDisplay = Entity()
+        
+        private var lastDrawnProgress: Float? = nil
+        
+        // Check for change in Camera Tracking state
         func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
             
             let message: String  
@@ -258,10 +291,215 @@ struct ARCameraView: UIViewRepresentable {
                 self.trackingMessage.wrappedValue = message
             }
         }
+        
+        // Calls this When there is A new AR Frame
+        func session(_ session: ARSession, didUpdate frame: ARFrame) {
+            guard let routeAnchor = routeAnchor else {
+                    return
+            }
+            
+            // Get the phone's position in the AR world's coordinates.
+            let translation = frame.camera.transform.columns.3
+            let worldPosition = SIMD3<Float>(translation.x,translation.y,translation.z)
+            
+            // Express that position relative to our route anchor.
+            cameraRoutePosition = routeAnchor.convert(position: worldPosition, from: nil)
+            
+            let progress: Float?
+            
+            // Calculate progress only while AR tracking is normal.
+            if case .normal = frame.camera.trackingState,
+                  let position = cameraRoutePosition {
+                      progress = nearestRouteProgress(to: position)
+                  } else {
+                      progress = nil
+                  }
+            
+            Task { @MainActor in
+                self.routeProgressMeters.wrappedValue = progress
+                
+                guard let progress = progress else {
+                    self.routeDisplay.isEnabled = false
+                    self.lastDrawnProgress = nil
+                    return
+                }
+                
+                self.routeDisplay.isEnabled = true
+                
+                // Redraw initially, then after at least 10 cm of progress change
+                if let previous = self.lastDrawnProgress, abs(progress - previous) < 0.1 {
+                    return
+                }
+                
+                self.redrawRoute(from: progress)
+                self.lastDrawnProgress = progress
+            }
+            
+        }
+        
+        // Finds the closest Position along a segment as a fraction from 0 to 1.
+        private func fractionAlongSegment(position: SIMD3<Float>, start: SIMD3<Float>, end: SIMD3<Float>) -> Float {
+            
+            let segment = end - start
+            let toPhone = position - start
+            let lengthSquared = segment.x * segment.x + segment.z * segment.z
+            
+            guard lengthSquared > 0 else {
+                return 0
+            }
+            
+            let fraction = (toPhone.x * segment.x + toPhone.z * segment.z) / lengthSquared
+            
+            return min(max(fraction, 0), 1)
+        }
+        
+        // Returns the distance along the route to its closest point to the phone
+        
+        private func nearestRouteProgress(to position: SIMD3<Float>) -> Float? {
+            guard routePoints.count >= 2 else {
+                return nil
+            }
+            
+            var distanceBeforeSegment: Float = 0
+            var closestDistance = Float.infinity
+            var bestProgress: Float? = nil
+            
+            for (start, end) in zip(routePoints, routePoints.dropFirst()) {
+                let segment = end - start
+                let segmentLength = hypot(segment.x, segment.z)
+                guard segmentLength > 0 else { continue }
+                
+                let fraction = fractionAlongSegment(position: position, start: start, end: end)
+                
+                let closestPoint = start + segment * fraction
+                let distanceToPhone = hypot(position.x - closestPoint.x, position.z - closestPoint.z)
+                
+                if distanceToPhone < closestDistance {
+                    closestDistance = distanceToPhone
+                    
+                    bestProgress = distanceBeforeSegment + segmentLength * fraction
+                }
+                distanceBeforeSegment += segmentLength
+            }
+            return bestProgress
+        }
+        
+        // Finds a postion at a given distance along the full route
+        private func pointAlongRoute(at distance: Float) -> SIMD3<Float>? {
+            guard let first = routePoints.first else {
+                return nil
+            }
+            
+            if distance <= 0 {
+                return first
+            }
+            
+            var remaining = distance
+            
+            for (start, end) in zip(routePoints, routePoints.dropFirst()) {
+                let segment = end - start
+                let length = hypot(segment.x, segment.z)
+                
+                guard length > 0 else { continue }
+                
+                if remaining <= length {
+                    let fraction = remaining / length
+                    return start + segment * fraction
+                }
+                
+                remaining -= length
+            }
+            
+            // Distances beyond the route stop at its destination.
+            return routePoints.last
+        }
+        
+        private func visibleRoutepoints(from progress: Float, length: Float) -> [SIMD3<Float>] {
+            guard length > 0 else { return [] }
+            
+            let startDistance = max(0, progress)
+            let endDistance = startDistance + length
+            
+            guard let startPoint = pointAlongRoute(at: startDistance),
+                  let endPoint = pointAlongRoute(at: endDistance) else {
+                return []
+            }
+            
+            var points = [startPoint]
+            var distanceAlongRoute: Float = 0
+            
+            for (start, end) in zip(routePoints, routePoints.dropFirst()) {
+                let segment = end - start
+                let segmentLength = hypot(segment.x, segment.z)
+                
+                guard segmentLength > 0 else { continue }
+                
+                distanceAlongRoute += segmentLength
+                
+                // Keep route vertices strictly inside the visible section
+                if distanceAlongRoute > startDistance,
+                   distanceAlongRoute < endDistance {
+                    points.append(end)
+                }
+                
+                if distanceAlongRoute >= endDistance {
+                    break
+                }
+                
+            }
+            
+            // Avoid repeating the endpoint when it is already included.
+            if let last = points.last, hypot(endPoint.x - last.x, endPoint.z - last.z) > 0 {
+                points.append(endPoint)
+            }
+            
+            return points
+        }
+        
+        // Redraws Yellow line from current progress
+        private func redrawRoute(from progress: Float) {
+            // Generates the next 5 meters
+            let points = visibleRoutepoints(from: progress, length: 5)
+            
+            for child in Array(routeDisplay.children) {
+                child.removeFromParent()
+            }
+            
+            guard points.count >= 2 else { return }
+            
+            for (start, end) in zip(points, points.dropFirst()) {
+                let segment = end - start
+                let length = hypot(segment.x, segment.z)
+                
+                guard length > 0 else { continue }
+                
+                let strip = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.12, 0.01, length)), materials: [SimpleMaterial(color: .yellow, isMetallic: false)])
+                
+                strip.position = SIMD3<Float>((start.x + end.x) / 2, 0.015, (start.z + end.z) / 2)
+                
+                let angle = atan2(segment.x, segment.z)
+                strip.orientation = simd_quatf(angle: angle, axis: SIMD3<Float>(0, 1, 0))
+                
+                routeDisplay.addChild(strip)
+                
+            }
+            
+            // Mark the end of the visible section
+            if let last = points.last {
+                let marker = ModelEntity(mesh: .generateSphere(radius: 0.05), materials: [SimpleMaterial(color: .green, isMetallic: false)])
+                
+                marker.position = SIMD3<Float>(last.x, 0.05, last.z)
+                routeDisplay.addChild(marker)
+            }
+        }
+        
+        func resetRouteDisplayProgress() {
+            lastDrawnProgress = nil
+        }
     }
     
     func makeCoordinator() -> Coordinator {
-        Coordinator(trackingMessage: $trackingMessage)
+        Coordinator(trackingMessage: $trackingMessage, routeProgressMeters: $routeProgressMeters)
     }
     
     // Checks for Horizontal surface

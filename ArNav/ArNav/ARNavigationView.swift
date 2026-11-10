@@ -18,6 +18,8 @@ struct ARNavigationView: View {
     @State private var surfaceMessage = "Stand still and tilt your phone down until the walkway is in the center of the screen."
     @State private var detectedSurfacePoint: SIMD3<Float>? = nil
     
+    @State private var routeProgressMeters: Float? = nil
+    
     @Environment(\.dismiss) private var dismiss
     
     private var routeStartOffset: LocalRoutePoint? {
@@ -31,7 +33,7 @@ struct ARNavigationView: View {
     var body: some View {
         ZStack {
             // Displays the AR Camera
-            ARCameraView(trackingMessage: $trackingMessage, routeCoordinates: routeCoordinates, surfaceCheckCount: surfaceCheckCount, surfaceMessage: $surfaceMessage, detectedSurfacePoint: $detectedSurfacePoint, routeStartOffset: routeStartOffset)
+            ARCameraView(trackingMessage: $trackingMessage, routeCoordinates: routeCoordinates, surfaceCheckCount: surfaceCheckCount, surfaceMessage: $surfaceMessage, detectedSurfacePoint: $detectedSurfacePoint, routeProgressMeters: $routeProgressMeters, routeStartOffset: routeStartOffset)
                 .ignoresSafeArea()
             
             VStack {
@@ -78,11 +80,24 @@ struct ARNavigationView: View {
                     
                 }
                 Spacer()
+                if let progress = routeProgressMeters {
+                    Text("Route progress: \(progress, specifier: "%.1f") m")
+                            .foregroundStyle(.white)
+                            .padding(8)
+                            .background(
+                                .ultraThinMaterial,
+                                in: RoundedRectangle(cornerRadius: 12)
+                            )
+                } else {
+                    Text("Waiting for route progress…")
+                            .foregroundStyle(.white)
+                }
                 // Checks for horizontal surface
                 Button("Check surface") {
                     surfaceCheckCount += 1
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(detectedSurfacePoint != nil)
                 
                 Text(surfaceMessage)
                     .foregroundStyle(.white)
