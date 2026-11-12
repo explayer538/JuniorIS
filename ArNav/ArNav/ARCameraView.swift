@@ -21,13 +21,14 @@ struct ARCameraView: UIViewRepresentable {
     let routeCoordinates: [CLLocationCoordinate2D]
     
     let surfaceCheckCount: Int
+    
     @Binding var surfaceMessage: String
-    
     @Binding var detectedSurfacePoint: SIMD3<Float>?
-    
     @Binding var routeProgressMeters: Float?
+    @Binding var distanceFromRouteMeters: Float?
     
     let routeStartOffset: LocalRoutePoint?
+    let alignmentRequestCount: Int
     
     
     // stores an array local points used for Drawing AR route
@@ -100,6 +101,22 @@ struct ARCameraView: UIViewRepresentable {
     }
     // allows us to change the existing view
     func updateUIView(_ uiView: UIViewType, context: Context) {
+        if alignmentRequestCount != context.coordinator.lastAlignmentRequestCount {
+            context.coordinator.lastAlignmentRequestCount = alignmentRequestCount
+            
+            Task { @MainActor in
+                guard let frame = uiView.session.currentFrame else {
+                    surfaceMessage = "Wait for camera tracking to be ready."
+                    return
+                }
+                let result = context.coordinator.alignRoute(in: frame)
+                surfaceMessage = result.message
+            }
+            return
+        }
+        guard context.coordinator.routeAnchor == nil else {
+            return
+        }
         // makes sure surface checkcount is not equal to the last
         guard surfaceCheckCount != context.coordinator.lastSurfaceCheckCount else {
             return
@@ -239,6 +256,7 @@ struct ARCameraView: UIViewRepresentable {
         
         Task { @MainActor in
             detectedSurfacePoint = point
+            checkMessage += "\nStand still and point along the sidewalk to align automatically."
             surfaceMessage = checkMessage
         }
     }
@@ -252,18 +270,30 @@ struct ARCameraView: UIViewRepresentable {
     class Coordinator: NSObject, ARSessionDelegate {
         // Binding variable that gives use the same message from AR navigation
         private let trackingMessage: Binding<String>
+        private let distanceFromRouteBinding: Binding<Float?>
+        private var routeProgressMeters: Binding<Float?>
+        private let surfaceMessage: Binding<String>
         // Setting class tracking message variable to the one passage in the Coordinator
-        init(trackingMessage: Binding<String>, routeProgressMeters: Binding<Float?>) {
+        init(trackingMessage: Binding<String>, routeProgressMeters: Binding<Float?>, distanceFromRouteMeters: Binding<Float?>, surfaceMessage: Binding<String>) {
             self.trackingMessage = trackingMessage
             self.routeProgressMeters = routeProgressMeters
+            self.distanceFromRouteBinding = distanceFromRouteMeters
+            self.surfaceMessage = surfaceMessage
         }
         
         var lastSurfaceCheckCount = 0
+        
+        var lastAlignmentRequestCount = 0
+        private var hasAutomaticallyAligned = false
+        private var alignmentCandidate: (heading: Float, timestamp: TimeInterval)?
+        private var arOffsetStartedAt: TimeInterval?
+        private var hasSustainedAROffset = false
+        
         var routeAnchor: AnchorEntity? = nil
         // Full route positions, measured relative to the route anchor.
         var routePoints: [SIMD3<Float>] = []
         var cameraRoutePosition: SIMD3<Float>? = nil
-        private var routeProgressMeters: Binding<Float?>
+        private(set) var distanceFromRouteMeters: Float? = nil
         
         let routeDisplay = Entity()
         
@@ -314,9 +344,28 @@ struct ARCameraView: UIViewRepresentable {
                   } else {
                       progress = nil
                   }
+            // Capture the sideways distance for this frame.
+            // Invalid progress means this measurement should also be unavailable
+            let sidewaysDistance = progress != nil ? distanceFromRouteMeters : nil
             
             Task { @MainActor in
+                self.distanceFromRouteBinding.wrappedValue = sidewaysDistance
                 self.routeProgressMeters.wrappedValue = progress
+                self.updateAROffsetEvidence(distance: sidewaysDistance, timestamp: frame.timestamp)
+                if !self.hasAutomaticallyAligned {
+                    if let progress, self.routeDirection(at: progress) != nil {
+                        if self.hasSteadyAlignmentHeading(in: frame) {
+                            let result = self.alignRoute(in: frame)
+                            self.surfaceMessage.wrappedValue = result.message
+                            
+                            if result.didAlign {
+                                return
+                            }
+                        }
+                    } else {
+                        self.alignmentCandidate = nil
+                    }
+                }
                 
                 guard let progress = progress else {
                     self.routeDisplay.isEnabled = false
@@ -356,6 +405,7 @@ struct ARCameraView: UIViewRepresentable {
         // Returns the distance along the route to its closest point to the phone
         
         private func nearestRouteProgress(to position: SIMD3<Float>) -> Float? {
+            distanceFromRouteMeters = nil
             guard routePoints.count >= 2 else {
                 return nil
             }
@@ -380,6 +430,9 @@ struct ARCameraView: UIViewRepresentable {
                     bestProgress = distanceBeforeSegment + segmentLength * fraction
                 }
                 distanceBeforeSegment += segmentLength
+            }
+            if bestProgress != nil {
+                distanceFromRouteMeters = closestDistance
             }
             return bestProgress
         }
@@ -410,7 +463,7 @@ struct ARCameraView: UIViewRepresentable {
                 remaining -= length
             }
             
-            // Distances beyond the route stop at its destination.
+            // Distances beyond the route stop at its destination
             return routePoints.last
         }
         
@@ -492,14 +545,171 @@ struct ARCameraView: UIViewRepresentable {
                 routeDisplay.addChild(marker)
             }
         }
+        // direction of the route segment user is on
+        private func routeDirection(at progress: Float) -> SIMD3<Float>? {
+            guard progress >= 0 else {
+                return nil
+            }
+        
+            var distanceBeforeSegment: Float = 0
+            var checkedDistance: Float = 0
+            var referenceDirection: SIMD3<Float>? = nil
+            
+            let requiredDistance: Float = 5
+            let minimumDotProduct = cos(Float.pi / 18)
+            
+            //Looping through point neighboring paths
+            for (start, end) in zip(routePoints, routePoints.dropFirst()) {
+                let segment = end - start
+                let length = hypot(segment.x, segment.z)
+                
+                guard length > 0 else {
+                    continue
+                }
+                
+                let segmentEnd = distanceBeforeSegment + length
+                
+                if segmentEnd <= progress {
+                    distanceBeforeSegment = segmentEnd
+                    continue
+                }
+                
+                let direction = segment / length
+                
+                if referenceDirection == nil {
+                    referenceDirection = direction
+                }
+                
+                guard let referenceDirection = referenceDirection else {
+                    return nil
+                }
+                
+                let dotProduct = referenceDirection.x * direction.x + referenceDirection.z * direction.z
+                
+                // A difference greater than 10 degrees means a bend is too close, so end
+                guard dotProduct >= minimumDotProduct else {
+                    return nil
+                }
+                
+                let availableLength = segmentEnd - max(progress, distanceBeforeSegment)
+                
+                checkedDistance += availableLength
+                
+                if checkedDistance >= requiredDistance {
+                    return referenceDirection
+                }
+                
+                distanceBeforeSegment = segmentEnd
+            }
+            
+            // Not enough route remains to verify five straight meters.
+            return nil
+        }
+        
+        private func hasSteadyAlignmentHeading(in frame: ARFrame) -> Bool {
+            guard case .normal = frame.camera.trackingState else {
+                alignmentCandidate = nil
+                return false
+            }
+            let cameraZ = frame.camera.transform.columns.2
+            let forwardX = -cameraZ.x
+            let forwardZ = -cameraZ.z
+            
+            guard hypot(forwardX, forwardZ) > 0.3 else {
+                alignmentCandidate = nil
+                return false
+            }
+            
+            let heading = atan2(forwardX, forwardZ)
+            
+            guard let candidate = alignmentCandidate else {
+                alignmentCandidate = (heading, frame.timestamp)
+                return false
+            }
+            
+            let difference = heading - candidate.heading
+            let headingChange = abs(atan2(sin(difference), cos(difference))) * 180 / Float.pi
+            if headingChange > 3 {
+                alignmentCandidate = (heading, frame.timestamp)
+                return false
+            }
+            
+            return frame.timestamp - candidate.timestamp >= 1.0
+        }
+        
+        // Helps to align the Route
+        func alignRoute(in frame: ARFrame) -> (didAlign: Bool, message: String) {
+            guard let anchor = routeAnchor,
+                  let progress = routeProgressMeters.wrappedValue,
+                  let routePoint = pointAlongRoute(at: progress) else {
+                return (false,"Wait for the route to be placed before aligning.")
+            }
+            
+            guard case .normal = frame.camera.trackingState else {
+                return (false,"Wait for camera tracking to be ready.")
+            }
+            
+            guard let direction = routeDirection(at: progress) else {
+                return (false,"Align on a straight section, at least five meters before the next bend.")
+            }
+            
+            let cameraZ = frame.camera.transform.columns.2
+            let cameraForward = SIMD3<Float>(-cameraZ.x, 0, -cameraZ.z)
+            let horizontalLength = hypot(cameraForward.x, cameraForward.z)
+            
+            guard horizontalLength > 0.3 else {
+                return (false, "Point your phone farther ahead along the walkway.")
+            }
+            // Gets the Camera and Route Angle subtracts for the correction
+            let cameraAngle = atan2(cameraForward.x, cameraForward.z)
+            let routeAngle = atan2(direction.x, direction.z)
+            let correctionAngle = cameraAngle - routeAngle
+            
+            let rotation = simd_quatf(angle: correctionAngle, axis: SIMD3<Float>(0, 1, 0))
+            
+            let cameraPosition = frame.camera.transform.columns.3
+            let rotatedRoutePoint = rotation.act(routePoint)
+            let groundHeight = anchor.position.y
+            
+            // rotates and Moves the anchor so current point along the route is under me
+            anchor.orientation = rotation
+            anchor.position = SIMD3<Float>(cameraPosition.x - rotatedRoutePoint.x, groundHeight, cameraPosition.z - rotatedRoutePoint.z)
+            
+            cameraRoutePosition = routePoint
+            distanceFromRouteMeters = 0
+            distanceFromRouteBinding.wrappedValue = 0
+            
+            redrawRoute(from: progress)
+            routeDisplay.isEnabled = true
+            lastDrawnProgress = progress
+            hasAutomaticallyAligned = true
+            alignmentCandidate = nil
+            
+            return (true, String(format: "Route Aligned at %.1f m. Progress Preserved", progress))
+        }
         
         func resetRouteDisplayProgress() {
             lastDrawnProgress = nil
         }
+        
+        private func updateAROffsetEvidence(distance: Float?, timestamp: TimeInterval) {
+            guard let distance, distance >= 1.5 else {
+                arOffsetStartedAt = nil
+                hasSustainedAROffset = false
+                return
+            }
+            
+            guard let startedAt = arOffsetStartedAt else {
+                arOffsetStartedAt = timestamp
+                return
+            }
+            
+            hasSustainedAROffset = timestamp - startedAt >= 3.0
+        }
     }
     
     func makeCoordinator() -> Coordinator {
-        Coordinator(trackingMessage: $trackingMessage, routeProgressMeters: $routeProgressMeters)
+        Coordinator(trackingMessage: $trackingMessage, routeProgressMeters: $routeProgressMeters, distanceFromRouteMeters: $distanceFromRouteMeters, surfaceMessage: $surfaceMessage)
     }
     
     // Checks for Horizontal surface

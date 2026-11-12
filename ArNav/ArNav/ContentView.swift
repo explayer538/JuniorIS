@@ -846,7 +846,7 @@ struct ContentView: View {
         // changes screen when ar navigation is true
         .fullScreenCover(isPresented: $isShowingARNavigarion) {
             if let destination = selectedDestination, let location = arStartLocation {
-                ARNavigationView(destinationName: destination.name, routeCoordinates: arRouteCoordinates, startLocation: location)
+                ARNavigationView(destinationName: destination.name, routeCoordinates: arRouteCoordinates, startLocation: location, locationManger: locationManger)
             }
         }
         
