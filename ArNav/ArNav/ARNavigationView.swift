@@ -97,6 +97,21 @@ struct ARNavigationView: View {
         return (progress: bestProgress, distance: closestDistance)
     }
     
+    private var gpsSupportsARRealignment: Bool {
+        guard let location = locationManger.currentLocation,
+              let match = gpsRouteMatch else {
+            return false
+        }
+        
+        let age = Date().timeIntervalSince(location.timestamp)
+        
+        guard age >= -5, age <= 5, location.horizontalAccuracy <= 5 else {
+            return false
+        }
+        
+        return match.distance <= 3
+    }
+    
     private func updateGPSDeviationEvidence() {
         guard let location = locationManger.currentLocation,
               let match = gpsRouteMatch else {
@@ -129,7 +144,7 @@ struct ARNavigationView: View {
     var body: some View {
         ZStack {
             // Displays the AR Camera
-            ARCameraView(trackingMessage: $trackingMessage, routeCoordinates: routeCoordinates, surfaceCheckCount: surfaceCheckCount, surfaceMessage: $surfaceMessage, detectedSurfacePoint: $detectedSurfacePoint, routeProgressMeters: $routeProgressMeters, distanceFromRouteMeters: $distanceFromRouteMeters, routeStartOffset: routeStartOffset, alignmentRequestCount: alignmentRequestCount)
+            ARCameraView(trackingMessage: $trackingMessage, routeCoordinates: routeCoordinates, surfaceCheckCount: surfaceCheckCount, surfaceMessage: $surfaceMessage, detectedSurfacePoint: $detectedSurfacePoint, routeProgressMeters: $routeProgressMeters, distanceFromRouteMeters: $distanceFromRouteMeters, routeStartOffset: routeStartOffset, alignmentRequestCount: alignmentRequestCount, gpsSupportsRealignment: {gpsSupportsARRealignment})
                 .ignoresSafeArea()
             
             VStack {

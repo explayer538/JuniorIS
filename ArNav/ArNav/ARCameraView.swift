@@ -29,6 +29,7 @@ struct ARCameraView: UIViewRepresentable {
     
     let routeStartOffset: LocalRoutePoint?
     let alignmentRequestCount: Int
+    let gpsSupportsRealignment: () -> Bool
     
     
     // stores an array local points used for Drawing AR route
@@ -101,6 +102,7 @@ struct ARCameraView: UIViewRepresentable {
     }
     // allows us to change the existing view
     func updateUIView(_ uiView: UIViewType, context: Context) {
+        context.coordinator.gpsSupportsRealignment = gpsSupportsRealignment
         if alignmentRequestCount != context.coordinator.lastAlignmentRequestCount {
             context.coordinator.lastAlignmentRequestCount = alignmentRequestCount
             
@@ -284,10 +286,12 @@ struct ARCameraView: UIViewRepresentable {
         var lastSurfaceCheckCount = 0
         
         var lastAlignmentRequestCount = 0
+        private var lastAlignmentTimestamp: TimeInterval?
         private var hasAutomaticallyAligned = false
         private var alignmentCandidate: (heading: Float, timestamp: TimeInterval)?
         private var arOffsetStartedAt: TimeInterval?
         private var hasSustainedAROffset = false
+        var gpsSupportsRealignment: () -> Bool = { false }
         
         var routeAnchor: AnchorEntity? = nil
         // Full route positions, measured relative to the route anchor.
@@ -298,6 +302,7 @@ struct ARCameraView: UIViewRepresentable {
         let routeDisplay = Entity()
         
         private var lastDrawnProgress: Float? = nil
+        private var walkingDirectionStart: (position: SIMD3<Float>, timestamp: TimeInterval)?
         
         // Check for change in Camera Tracking state
         func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
@@ -365,6 +370,10 @@ struct ARCameraView: UIViewRepresentable {
                     } else {
                         self.alignmentCandidate = nil
                     }
+                }
+                
+                if self.correctAROffsetIfNeeded(in: frame, progress: progress) {
+                    return
                 }
                 
                 guard let progress = progress else {
@@ -638,7 +647,7 @@ struct ARCameraView: UIViewRepresentable {
         }
         
         // Helps to align the Route
-        func alignRoute(in frame: ARFrame) -> (didAlign: Bool, message: String) {
+        func alignRoute(in frame: ARFrame,walkingDirection: SIMD3<Float>? = nil) -> (didAlign: Bool, message: String) {
             guard let anchor = routeAnchor,
                   let progress = routeProgressMeters.wrappedValue,
                   let routePoint = pointAlongRoute(at: progress) else {
@@ -653,17 +662,26 @@ struct ARCameraView: UIViewRepresentable {
                 return (false,"Align on a straight section, at least five meters before the next bend.")
             }
             
-            let cameraZ = frame.camera.transform.columns.2
-            let cameraForward = SIMD3<Float>(-cameraZ.x, 0, -cameraZ.z)
-            let horizontalLength = hypot(cameraForward.x, cameraForward.z)
+            let targetDirection: SIMD3<Float>
+        
+            if let walkingDirection {
+                // Align Route with the direction the User is heading in
+                targetDirection = walkingDirection
+            } else {
+                // Align Route with where the phone Points
+                let cameraZ = frame.camera.transform.columns.2
+                targetDirection = SIMD3<Float>(-cameraZ.x, 0, -cameraZ.z)
+            }
             
+            let horizontalLength = hypot(targetDirection.x, targetDirection.z)
+
             guard horizontalLength > 0.3 else {
                 return (false, "Point your phone farther ahead along the walkway.")
             }
-            // Gets the Camera and Route Angle subtracts for the correction
-            let cameraAngle = atan2(cameraForward.x, cameraForward.z)
+            
+            let targetAngle = atan2(targetDirection.x, targetDirection.z)
             let routeAngle = atan2(direction.x, direction.z)
-            let correctionAngle = cameraAngle - routeAngle
+            let correctionAngle = targetAngle - routeAngle
             
             let rotation = simd_quatf(angle: correctionAngle, axis: SIMD3<Float>(0, 1, 0))
             
@@ -685,6 +703,11 @@ struct ARCameraView: UIViewRepresentable {
             hasAutomaticallyAligned = true
             alignmentCandidate = nil
             
+            lastAlignmentTimestamp = frame.timestamp
+            walkingDirectionStart = nil
+            arOffsetStartedAt = nil
+            hasSustainedAROffset = false
+            
             return (true, String(format: "Route Aligned at %.1f m. Progress Preserved", progress))
         }
         
@@ -705,6 +728,67 @@ struct ARCameraView: UIViewRepresentable {
             }
             
             hasSustainedAROffset = timestamp - startedAt >= 3.0
+        }
+        // Estimating the walking direction from the camera Movement
+        private func sampleWalkingDirection(in frame: ARFrame) -> SIMD3<Float>? {
+            
+            guard case .normal = frame.camera.trackingState else {
+                walkingDirectionStart = nil
+                return nil
+            }
+            
+            let translation = frame.camera.transform.columns.3
+            let position = SIMD3<Float>(translation.x, 0, translation.z)
+            
+            guard let start = walkingDirectionStart else {
+                walkingDirectionStart = (position, frame.timestamp)
+                return nil
+            }
+            
+            if frame.timestamp - start.timestamp > 8 {
+                walkingDirectionStart = (position, frame.timestamp)
+                return nil
+            }
+            
+            let movement = position - start.position
+            let distance = hypot(movement.x, movement.z)
+            
+            guard distance >= 3 else {
+                return nil
+            }
+            
+            walkingDirectionStart = (position, frame.timestamp)
+            
+            return movement / distance
+        }
+        
+        private func correctAROffsetIfNeeded(in frame: ARFrame, progress: Float?) -> Bool {
+            
+            let walkingDirection = sampleWalkingDirection(in: frame)
+            
+            guard hasAutomaticallyAligned, hasSustainedAROffset,
+                  let walkingDirection, let progress,
+                  let anchor = routeAnchor, let lastAlignmentTimestamp,
+                  let routeDirection = routeDirection(at: progress),
+                  frame.timestamp - lastAlignmentTimestamp >= 5 else {
+                return false
+            }
+            
+            let displayedDirection = anchor.orientation.act(routeDirection)
+            let agreement = displayedDirection.x * walkingDirection.x + displayedDirection.z * displayedDirection.z
+            
+            guard agreement >= cos(20 * Float.pi / 180), gpsSupportsRealignment() else {
+                return false
+            }
+            
+            let result = alignRoute(in: frame, walkingDirection: walkingDirection)
+            
+            if result.didAlign {
+                surfaceMessage.wrappedValue = "Route realigned using your walking direction."
+            }
+            
+            return result.didAlign
+                    
         }
     }
     
