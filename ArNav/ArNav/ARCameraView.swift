@@ -761,7 +761,7 @@ struct ARCameraView: UIViewRepresentable {
             
             return movement / distance
         }
-        
+        // Correcting the AR Route Offset
         private func correctAROffsetIfNeeded(in frame: ARFrame, progress: Float?) -> Bool {
             
             let walkingDirection = sampleWalkingDirection(in: frame)
@@ -796,18 +796,16 @@ struct ARCameraView: UIViewRepresentable {
         Coordinator(trackingMessage: $trackingMessage, routeProgressMeters: $routeProgressMeters, distanceFromRouteMeters: $distanceFromRouteMeters, surfaceMessage: $surfaceMessage)
     }
     
-    // Checks for Horizontal surface
+    // Checks for Horizontal surface and returns its po
     private func horizontalSurfacePoint(in arView: ARView) -> SIMD3<Float>? {
-        // Stores the center of the screen
+    
         let screenCenter = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
-        
         // Stores the first hit when raycasting on a detected horizontal surface
         guard let hit = arView.raycast(from: screenCenter, allowing: .existingPlaneGeometry, alignment: .horizontal).first else {
             return nil
         }
-        
-        // Stores the postion of the imaginary plane drawn
         let position = hit.worldTransform.columns.3
         return SIMD3<Float>(position.x, position.y, position.z)
+        
     }
 }

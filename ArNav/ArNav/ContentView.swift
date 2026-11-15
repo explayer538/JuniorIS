@@ -393,10 +393,29 @@ struct ContentView: View {
     @State private var cameraPermissionMessage: String? = nil
     
     @State private var isShowingARNavigarion = false
-    
     @State private var arStartLocation: CLLocation? = nil
-    
     @State private var arRouteCoordinates: [CLLocationCoordinate2D] = []
+    @State private var arRouteSessionID = UUID()
+    @State private var arRerouteMessage: String? = nil
+    
+    
+    private func recalculateActiveRoute(to destination: Destination) -> Bool {
+        
+        calculateRoute(to: destination, isRefresh: true)
+        let coordinates = selectedRouteCoordinates
+        
+        guard routeMessage == nil,
+              let routeLocation = lastRouteCalculationLocation,
+              coordinates.count >= 2 else {
+            return false
+        }
+        
+        arStartLocation = routeLocation
+        arRouteCoordinates = coordinates
+        arRerouteMessage = "Route recalculated to \(destination.name)."
+        arRouteSessionID = UUID()
+        return true
+    }
     
     @MainActor
     private func startNavigation(to destination: Destination) async {
@@ -420,6 +439,7 @@ struct ContentView: View {
         //Save the location used for this route calculation
         arStartLocation = routeLocation
         arRouteCoordinates = selectedRouteCoordinates
+        arRerouteMessage = nil
         isShowingARNavigarion = true
         
     }
@@ -846,7 +866,8 @@ struct ContentView: View {
         // changes screen when ar navigation is true
         .fullScreenCover(isPresented: $isShowingARNavigarion) {
             if let destination = selectedDestination, let location = arStartLocation {
-                ARNavigationView(destinationName: destination.name, routeCoordinates: arRouteCoordinates, startLocation: location, locationManger: locationManger)
+                ARNavigationView(destinationName: destination.name, routeCoordinates: arRouteCoordinates, startLocation: location, locationManger: locationManger, rerouteMessage: arRerouteMessage, onReroute: {recalculateActiveRoute(to: destination)})
+                    .id(arRouteSessionID)
             }
         }
         
