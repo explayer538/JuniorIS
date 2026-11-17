@@ -284,7 +284,6 @@ struct ARCameraView: UIViewRepresentable {
         }
         
         var lastSurfaceCheckCount = 0
-        
         var lastAlignmentRequestCount = 0
         private var lastAlignmentTimestamp: TimeInterval?
         private var hasAutomaticallyAligned = false
@@ -298,11 +297,47 @@ struct ARCameraView: UIViewRepresentable {
         var routePoints: [SIMD3<Float>] = []
         var cameraRoutePosition: SIMD3<Float>? = nil
         private(set) var distanceFromRouteMeters: Float? = nil
-        
         let routeDisplay = Entity()
-        
         private var lastDrawnProgress: Float? = nil
+        private var requiresRouteRecovery = false
+        private var lastReliableProgress: Float?
         private var walkingDirectionStart: (position: SIMD3<Float>, timestamp: TimeInterval)?
+        
+        private func requireRouteRecovery() {
+            // Keep lastReliableProgress so alignment can recover at that position.
+            requiresRouteRecovery = true
+
+            // Stop drawing or publishing progress from the old placement.
+            routeDisplay.isEnabled = false
+            routeProgressMeters.wrappedValue = nil
+            distanceFromRouteBinding.wrappedValue = nil
+            lastDrawnProgress = nil
+
+            // Discard measurements collected before the interruption.
+            alignmentCandidate = nil
+            walkingDirectionStart = nil
+            arOffsetStartedAt = nil
+            hasSustainedAROffset = false
+
+            surfaceMessage.wrappedValue =
+                "AR was interrupted. Wait for tracking, then stand on the walkway and tap Align Route."
+        }
+        
+        func sessionWasInterrupted(_ session: ARSession) {
+            Task { @MainActor in
+                self.requireRouteRecovery()
+            }
+        }
+
+        func sessionInterruptionEnded(_ session: ARSession) {
+            Task { @MainActor in
+                // Keep recovery active until alignment passes its placement check.
+                self.requiresRouteRecovery = true
+
+                self.surfaceMessage.wrappedValue =
+                    "Camera tracking is recovering. When ready, face along the walkway and tap Align Route."
+            }
+        }
         
         // Check for change in Camera Tracking state
         func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
@@ -329,31 +364,34 @@ struct ARCameraView: UIViewRepresentable {
         
         // Calls this When there is A new AR Frame
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            guard let routeAnchor = routeAnchor else {
-                    return
-            }
-            
-            // Get the phone's position in the AR world's coordinates.
-            let translation = frame.camera.transform.columns.3
-            let worldPosition = SIMD3<Float>(translation.x,translation.y,translation.z)
-            
-            // Express that position relative to our route anchor.
-            cameraRoutePosition = routeAnchor.convert(position: worldPosition, from: nil)
-            
-            let progress: Float?
-            
-            // Calculate progress only while AR tracking is normal.
-            if case .normal = frame.camera.trackingState,
-                  let position = cameraRoutePosition {
-                      progress = nearestRouteProgress(to: position)
-                  } else {
-                      progress = nil
-                  }
-            // Capture the sideways distance for this frame.
-            // Invalid progress means this measurement should also be unavailable
-            let sidewaysDistance = progress != nil ? distanceFromRouteMeters : nil
-            
             Task { @MainActor in
+                guard let routeAnchor = self.routeAnchor else {
+                        return
+                }
+                
+                // Get the phone's position in the AR world's coordinates.
+                let translation = frame.camera.transform.columns.3
+                let worldPosition = SIMD3<Float>(translation.x,translation.y,translation.z)
+                
+                // Express that position relative to our route anchor.
+                self.cameraRoutePosition = routeAnchor.convert(position: worldPosition, from: nil)
+            
+                let progress: Float?
+                
+                // Calculate progress only while AR tracking is normal.
+                if case .normal = frame.camera.trackingState, !self.requiresRouteRecovery,
+                   let position = self.cameraRoutePosition {
+                    progress = self.nearestRouteProgress(to: position)
+                      } else {
+                          progress = nil
+                      }
+                if let progress {
+                    self.lastReliableProgress = progress
+                }
+                // Capture the sideways distance for this frame.
+                // Invalid progress means this measurement should also be unavailable
+                let sidewaysDistance = progress != nil ? distanceFromRouteMeters : nil
+    
                 self.distanceFromRouteBinding.wrappedValue = sidewaysDistance
                 self.routeProgressMeters.wrappedValue = progress
                 self.updateAROffsetEvidence(distance: sidewaysDistance, timestamp: frame.timestamp)
@@ -649,7 +687,7 @@ struct ARCameraView: UIViewRepresentable {
         // Helps to align the Route
         func alignRoute(in frame: ARFrame,walkingDirection: SIMD3<Float>? = nil) -> (didAlign: Bool, message: String) {
             guard let anchor = routeAnchor,
-                  let progress = routeProgressMeters.wrappedValue,
+                  let progress = routeProgressMeters.wrappedValue ?? lastReliableProgress,
                   let routePoint = pointAlongRoute(at: progress) else {
                 return (false,"Wait for the route to be placed before aligning.")
             }
@@ -687,16 +725,47 @@ struct ARCameraView: UIViewRepresentable {
             
             let cameraPosition = frame.camera.transform.columns.3
             let rotatedRoutePoint = rotation.act(routePoint)
-            let groundHeight = anchor.position.y
+            let groundHeight = anchor.position(relativeTo: nil).y
             
             // rotates and Moves the anchor so current point along the route is under me
-            anchor.orientation = rotation
-            anchor.position = SIMD3<Float>(cameraPosition.x - rotatedRoutePoint.x, groundHeight, cameraPosition.z - rotatedRoutePoint.z)
+            anchor.setOrientation(rotation, relativeTo: nil)
             
-            cameraRoutePosition = routePoint
-            distanceFromRouteMeters = 0
-            distanceFromRouteBinding.wrappedValue = 0
+            anchor.setPosition(
+                SIMD3<Float>(
+                    cameraPosition.x - rotatedRoutePoint.x,
+                    groundHeight,
+                    cameraPosition.z - rotatedRoutePoint.z
+                ), relativeTo: nil )
+                
             
+            // Measures where the camera sits after moving the anchor.
+            let cameraWorldPosition = SIMD3<Float>(cameraPosition.x, cameraPosition.y, cameraPosition.z)
+            let cameraAfterAlignment = anchor.convert(position: cameraWorldPosition, from: nil)
+            let horizontalError = hypot(
+                cameraAfterAlignment.x - routePoint.x,
+                cameraAfterAlignment.z - routePoint.z
+            )
+
+            // Keep the measured position and error.
+            cameraRoutePosition = cameraAfterAlignment
+            distanceFromRouteMeters = horizontalError
+            distanceFromRouteBinding.wrappedValue = horizontalError
+
+            // Reject an alignment that failed to place the current route point beneath us.
+            guard horizontalError < 0.25 else {
+                requiresRouteRecovery = true
+                routeDisplay.isEnabled = false
+                routeProgressMeters.wrappedValue = nil
+
+                return (
+                    false,
+                    "Route placement could not be verified. Use View Map."
+                )
+            }
+            // Restore guidance only after the placement check passes.
+            requiresRouteRecovery = false
+            lastReliableProgress = progress
+            routeProgressMeters.wrappedValue = progress
             redrawRoute(from: progress)
             routeDisplay.isEnabled = true
             lastDrawnProgress = progress
@@ -716,7 +785,7 @@ struct ARCameraView: UIViewRepresentable {
         }
         
         private func updateAROffsetEvidence(distance: Float?, timestamp: TimeInterval) {
-            guard let distance, distance >= 1.5 else {
+            guard let distance, distance >= 0.8 else {
                 arOffsetStartedAt = nil
                 hasSustainedAROffset = false
                 return
@@ -774,8 +843,8 @@ struct ARCameraView: UIViewRepresentable {
                 return false
             }
             
-            let displayedDirection = anchor.orientation.act(routeDirection)
-            let agreement = displayedDirection.x * walkingDirection.x + displayedDirection.z * displayedDirection.z
+            let displayedDirection = anchor.orientation(relativeTo: nil).act(routeDirection)
+            let agreement = displayedDirection.x * walkingDirection.x + displayedDirection.z * walkingDirection.z
             
             guard agreement >= cos(20 * Float.pi / 180), gpsSupportsRealignment() else {
                 return false

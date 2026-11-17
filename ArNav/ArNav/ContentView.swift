@@ -22,13 +22,11 @@ struct ContentView: View {
     
     // Tracks whether the app scene is active, inactive or in background
     @Environment(\.scenePhase) private var scenePhase
-    
     //Creating the Location Manager
     @State private var locationManger = LocationManager()
-    
+    @State private var mapHeading: Double = 0
     // Stores Explanation when routing cannot continue
     @State private var routeMessage: String? = nil
-    
     //Selected Destination
     @State private var selectedMapDestinationID: String? = nil
     
@@ -45,6 +43,42 @@ struct ContentView: View {
     @State private var nearestNodeIDs: String? = nil
     @State private var nearestDistances: Double = 0.0
     @State private var selectedRouteDistance: Double? = nil
+    @State private var lastRouteCalculationLocation: CLLocation? = nil
+    @State private var routeStartNeedsConfirmation = false
+    @State private var alternateStartCoordinates: [CLLocationCoordinate2D] = []
+    @State private var isShowingStartConfirmation = false
+    @State private var shouldOpenARAfterStartReview = false
+    @State private var latestRouteStartDiagnostic = ""
+    @State private var activeRouteStartDiagnostic = ""
+    
+    // Recent destination IDs that makes an Array if the is saved data for the key
+    // if not intializes an empty array
+    @State private var recentDestinationIDs: [String] = UserDefaults.standard.stringArray(forKey: "recentDestinationIDs") ?? []
+    
+    // An Array which stores the IDs of the suggested Destinations
+    @State private var suggestedDestinationIDs: [String] = []
+    
+    // Walking graph for selected destination
+    @State private var walkingGraph: [String: [WalkingEdge]] = [:]
+    // Stores the selected route
+    @State private var selectedRoute: [WalkingEdge]? = nil
+    // Walking node coordinates
+    @State private var walkingNodeCoordinates: [String: CLLocationCoordinate2D] = [:]
+    
+    // object that requests camera permission
+    @State private var cameraPermissionManager = CameraPermissionManager()
+    // holds feedback when camera access is not available
+    @State private var cameraPermissionMessage: String? = nil
+    
+    @State private var isShowingARNavigarion = false
+    @State private var arStartLocation: CLLocation? = nil
+    @State private var arRouteCoordinates: [CLLocationCoordinate2D] = []
+    @State private var pendingAlternateStartCoordinates: [CLLocationCoordinate2D] = []
+    @State private var arRouteSessionID = UUID()
+    @State private var arRerouteMessage: String? = nil
+    
+    //Text Field Tracking state
+    @FocusState private var isSearchFocused: Bool
     
     //Variable that stores recently clicked locations
     private var recentDestinations: [Destination] {
@@ -55,13 +89,6 @@ struct ContentView: View {
         }
     }
     
-    // Recent destination IDs that makes an Array if the is saved data for the key
-    // if not intializes an empty array
-    @State private var recentDestinationIDs: [String] = UserDefaults.standard.stringArray(forKey: "recentDestinationIDs") ?? []
-    
-    //Text Field Tracking state
-    @FocusState private var isSearchFocused: Bool
-    
     // An array which stores the randomly selected suggested destinations
     private var suggestedDestinations: [Destination] {
         //create an array for Suggest IDs that match the destinations id
@@ -71,10 +98,6 @@ struct ContentView: View {
             }
         }
     }
-    
-    // An Array which stores the IDs of the suggested Destinations
-    @State private var suggestedDestinationIDs: [String] = []
-    
     
     //List of filtered destinations which returns all destinations if the users has not typed anything and if the user has filters based on what the user has typed.
     
@@ -101,15 +124,6 @@ struct ContentView: View {
         }
     }
     
-    // Walking graph for selected destination
-    @State private var walkingGraph: [String: [WalkingEdge]] = [:]
-    // Stores the selected route
-    @State private var selectedRoute: [WalkingEdge]? = nil
-    // Walking node coordinates
-    @State private var walkingNodeCoordinates: [String: CLLocationCoordinate2D] = [:]
-    
-   
-    
     // Setting the campus Region as a constant. This sets the map layers dimensions behind on the campus.
     
     private let campusRegion = MKCoordinateRegion(
@@ -122,9 +136,6 @@ struct ContentView: View {
             longitudeDelta: 0.007
         )
     )
-    
-    @State private var mapHeading: Double = 0
-    @State private var lastRouteCalculationLocation: CLLocation? = nil
     
     //select destinations function
     private func selectDestination(id: String){
@@ -159,6 +170,97 @@ struct ContentView: View {
         //Release the search focus so testfield is not active
         isSearchFocused = false
     }
+    
+    private func isAmbiguousRouteStart(_ closest: WalkingStartMatch, alternative: WalkingStartMatch?, accuracy: Double) -> Bool {
+        guard let alternative, alternative.distanceFromUser <= min(accuracy, 10 ) else {
+            return false
+        }
+        
+        let first = CLLocation(
+            latitude: closest.coordinate.latitude,
+            longitude: closest.coordinate.longitude
+        )
+        let second = CLLocation(
+            latitude: alternative.coordinate.latitude,
+            longitude: alternative.coordinate.longitude
+        )
+        
+        return first.distance(from: second) >= 2
+    }
+    // Gets the route from a start location
+    private func routeFromStart( _ startMatch: WalkingStartMatch, to destination: Destination, temporaryStartID: String) -> (edges: [WalkingEdge], distance: Double)? {
+        
+        var routingGraph = walkingGraph
+        let edge = startMatch.edge
+        let fraction = startMatch.fractionAlongEdge
+        
+        // Connect the matched point to both ends of the walkway.
+        routingGraph[temporaryStartID] = [
+            WalkingEdge(
+                wayID: edge.wayID,
+                fromNodeID: temporaryStartID,
+                toNodeID: edge.fromNodeID,
+                distanceMeters: fraction * edge.distanceMeters
+            ),
+            WalkingEdge(
+                wayID: edge.wayID,
+                fromNodeID: temporaryStartID,
+                toNodeID: edge.toNodeID,
+                distanceMeters: (1 - fraction) * edge.distanceMeters
+            )]
+        let candidateNodeIDs = destination.arrivalNodeID.map { [$0] } ?? destination.arrivalCandidateNodeIDs
+        let router = WalkingRouter()
+        var bestRoute: (edges: [WalkingEdge], distance: Double)?
+        
+        for nodeID in candidateNodeIDs {
+            guard let edges = router.findRoute(
+                from: temporaryStartID,
+                to: nodeID,
+                in: routingGraph
+            ) else {
+                continue
+            }
+
+            let distance = edges.reduce(0.0) { $0 + $1.distanceMeters }
+
+            if distance < (bestRoute?.distance ?? .infinity) {
+                bestRoute = (edges: edges, distance: distance)
+            }
+        }
+        return bestRoute
+    }
+    
+    private func pointNearRouteStart(_ edges: [WalkingEdge], from start: CLLocationCoordinate2D, at distance: Double) -> CLLocation? {
+        var previous = MKMapPoint(start)
+        var remaining = distance
+        
+        for edge in edges {
+            guard let coordinate = walkingNodeCoordinates[edge.toNodeID] else {
+                return nil
+            }
+
+            let next = MKMapPoint(coordinate)
+            let length = previous.distance(to: next)
+            guard length > 0 else { continue }
+
+            if remaining <= length {
+                let fraction = remaining / length
+                let point = MKMapPoint(
+                    x: previous.x + (next.x - previous.x) * fraction,
+                    y: previous.y + (next.y - previous.y) * fraction
+                ).coordinate
+
+                return CLLocation(latitude: point.latitude, longitude: point.longitude)
+            }
+
+            remaining -= length
+            previous = next
+        }
+        // For a route shorter than five meters, use its endpoint.
+        let endpoint = previous.coordinate
+        return CLLocation(latitude: endpoint.latitude, longitude: endpoint.longitude)
+    }
+    
     // Calculates the selected route
     private func calculateRoute(to destination: Destination, isRefresh: Bool = false) {
         
@@ -207,28 +309,29 @@ struct ContentView: View {
         let matcher = WalkingStartMatcher()
         
         // creates a variable that stores the nearest match
-        var nearestMatch: WalkingStartMatch? = nil
+        var nearestMatch: WalkingStartMatch?
+        var alternativeMatch: WalkingStartMatch?
+        var seenSegments = Set<[String]>()
         
-        // For each edge in the array of outgoing edges
         for edges in walkingGraph.values {
-            // for each edge segment in the edge
             for edge in edges {
-                
-                //Storing the matched point
+                let segmentKey = [edge.fromNodeID, edge.toNodeID].sorted()
+                guard seenSegments.insert(segmentKey).inserted else {
+                    continue
+                }
                 guard let match = matcher.match(location: location, to: edge, coordinates: walkingNodeCoordinates) else {
                     continue
                 }
-                
-                // if the neareast match distance from user exists then set as best ditance
-                let bestDistance = nearestMatch?.distanceFromUser ?? Double.infinity
-                
-                // If the match distance is less than the best distance
-                if match.distanceFromUser < bestDistance {
+                if match.distanceFromUser < (nearestMatch?.distanceFromUser ?? .infinity) {
+                    alternativeMatch = nearestMatch
                     nearestMatch = match
+                } else if match.distanceFromUser < (alternativeMatch?.distanceFromUser ?? .infinity) {
+                    alternativeMatch = match
                 }
-                
             }
         }
+        
+        
         // set Starting point to nearest amtch
         guard let startMatch = nearestMatch else {
             showRouteFailure(
@@ -239,6 +342,7 @@ struct ContentView: View {
             return
         }
         
+        
         guard startMatch.distanceFromUser <= 10 else {
             showRouteFailure(
                 "Your reported location could not be matched closely enough to a mapped walking path.",
@@ -246,77 +350,66 @@ struct ContentView: View {
             )
             return
         }
-        
-        // A copy of the walking graph to modify without affecting the actual network
-        var routingGraph = walkingGraph
-        // the new starting node we would add to the network
         let temporaryStartID = "temporary-user-start"
-        
-        //stores the matched edge
-        let matchedEdge = startMatch.edge
-        //stores the fraction of the user along the edge
-        let fraction = startMatch.fractionAlongEdge
-        
-        // distance to start od edge from user
-        let distanceToFrom = fraction * matchedEdge.distanceMeters
-        // distance to end to edge from user
-        let distanceToTo = (1-fraction) * matchedEdge.distanceMeters
-        
-        // add edges to the network
-        routingGraph[temporaryStartID] = [
-            WalkingEdge(wayID: matchedEdge.wayID, fromNodeID: temporaryStartID, toNodeID: matchedEdge.fromNodeID, distanceMeters: distanceToFrom),
-            WalkingEdge(wayID: matchedEdge.wayID, fromNodeID: temporaryStartID, toNodeID: matchedEdge.toNodeID, distanceMeters: distanceToTo)
-        ]
-        
-        // Store the coordinate in the global coordnate dict
-        
         nearestNodeIDs = startMatch.edge.wayID
         nearestDistances = startMatch.distanceFromUser
         
-       
-        //Intializes the router
-        let router = WalkingRouter()
-        //Stores the nodes that connect the oath and building
-        let candidateNodeIDs: [String]
-        // if the destination has an arrival node then we put that in candidateNodes
-        //else not we put the array of nodes that relate to the building and path
-        if let arrivalNodeID = destination.arrivalNodeID {
-            candidateNodeIDs = [arrivalNodeID]
-        } else {
-            candidateNodeIDs = destination.arrivalCandidateNodeIDs
-        }
-        
-        // set shortest distance to infinity
-        var shortestDistance = Double.infinity
-        
-        var foundNewRoute = false
-        
-        // Now for each of the candidate nodes we would find the one that gives us the shortest distance
-        for nodeID in candidateNodeIDs {
-            guard let route = router.findRoute(from: temporaryStartID, to: nodeID, in: routingGraph) else {
-                continue
-            }
-            
-            var routeDistance = 0.0
-            
-            for edge in route {
-                routeDistance += edge.distanceMeters
-            }
-            
-            if routeDistance < shortestDistance {
-                shortestDistance = routeDistance
-                selectedRoute = route
-                selectedRouteDistance = routeDistance
-                foundNewRoute = true
-                
-                
-            }
-        }
-        
-        if foundNewRoute {
+        if let result = routeFromStart(startMatch, to: destination, temporaryStartID: temporaryStartID
+        ) {
+            selectedRoute = result.edges
+            selectedRouteDistance = result.distance
             walkingNodeCoordinates[temporaryStartID] = startMatch.coordinate
             lastRouteCalculationLocation = location
-            print("Selected route distance: ", shortestDistance, "meters")
+            latestRouteStartDiagnostic = String(
+                format: "Start way: %@ · Path offset: %.1f m · GPS accuracy: %.1f m",
+                startMatch.edge.wayID,
+                startMatch.distanceFromUser,
+                location.horizontalAccuracy
+            )
+            if let alternativeMatch {
+                latestRouteStartDiagnostic += String(
+                    format: "\nNext segment: way %@ · Path offset: %.1f m",
+                    alternativeMatch.edge.wayID,
+                    alternativeMatch.distanceFromUser
+                )
+            }
+            routeStartNeedsConfirmation = false
+            alternateStartCoordinates = []
+            let comparisonLimit = min(location.horizontalAccuracy + 1.0, 10.0)
+            
+            if let alternativeMatch,
+               alternativeMatch.distanceFromUser <= comparisonLimit,
+               let alternativeRoute = routeFromStart(
+                   alternativeMatch,
+                   to: destination,
+                   temporaryStartID: temporaryStartID
+               ),
+               let primaryPoint = pointNearRouteStart(
+                   result.edges, from: startMatch.coordinate, at: 5
+               ),
+               let alternativePoint = pointNearRouteStart(
+                   alternativeRoute.edges, from: alternativeMatch.coordinate, at: 5
+               ) {
+                let separation = primaryPoint.distance(from: alternativePoint)
+                // A noticeable difference in the opening guidance may need confirmation.
+                routeStartNeedsConfirmation = separation >= 3.0
+
+                latestRouteStartDiagnostic += String(
+                    format: "\nRoutes are %.1f m apart after 5 m",
+                    separation
+                )
+                if routeStartNeedsConfirmation {
+                    latestRouteStartDiagnostic += "\nStart confirmation recommended"
+                    let endpoints = alternativeRoute.edges.compactMap {
+                        walkingNodeCoordinates[$0.toNodeID]
+                    }
+                    
+                    if !endpoints.isEmpty,endpoints.count == alternativeRoute.edges.count {
+                        alternateStartCoordinates = [alternativeMatch.coordinate] + endpoints
+                    }
+                }
+            }
+            
         } else {
             showRouteFailure(
                     "No walking route is available to this destination in the current campus map.",
@@ -387,16 +480,7 @@ struct ContentView: View {
         }
         return coordinates
     }
-    // object that requests camera permission
-    @State private var cameraPermissionManager = CameraPermissionManager()
-    // holds feedback when camera access is not available
-    @State private var cameraPermissionMessage: String? = nil
     
-    @State private var isShowingARNavigarion = false
-    @State private var arStartLocation: CLLocation? = nil
-    @State private var arRouteCoordinates: [CLLocationCoordinate2D] = []
-    @State private var arRouteSessionID = UUID()
-    @State private var arRerouteMessage: String? = nil
     
     
     private func recalculateActiveRoute(to destination: Destination) -> Bool {
@@ -412,6 +496,7 @@ struct ContentView: View {
         
         arStartLocation = routeLocation
         arRouteCoordinates = coordinates
+        activeRouteStartDiagnostic = latestRouteStartDiagnostic
         arRerouteMessage = "Route recalculated to \(destination.name)."
         arRouteSessionID = UUID()
         return true
@@ -439,8 +524,14 @@ struct ContentView: View {
         //Save the location used for this route calculation
         arStartLocation = routeLocation
         arRouteCoordinates = selectedRouteCoordinates
+        pendingAlternateStartCoordinates = alternateStartCoordinates
+        activeRouteStartDiagnostic = latestRouteStartDiagnostic
         arRerouteMessage = nil
-        isShowingARNavigarion = true
+        if routeStartNeedsConfirmation {
+            isShowingStartConfirmation = true
+        } else {
+            isShowingARNavigarion = true
+        }
         
     }
     
@@ -863,10 +954,82 @@ struct ContentView: View {
             // calculate route
             calculateRoute(to: destination, isRefresh: true)
         }
+        .sheet(
+            isPresented: $isShowingStartConfirmation,
+            onDismiss: {
+                pendingAlternateStartCoordinates = []
+
+                if shouldOpenARAfterStartReview {
+                    shouldOpenARAfterStartReview = false
+                    isShowingARNavigarion = true
+                }
+            }
+        ) {
+            NavigationStack {
+                let hasAlternateStart = pendingAlternateStartCoordinates.count >= 2
+                Map(initialPosition: .automatic) {
+                    UserAnnotation()
+
+                    if arRouteCoordinates.count >= 2 {
+                        MapPolyline(coordinates: arRouteCoordinates)
+                            .stroke(.blue, lineWidth: 6)
+
+                        if let start = arRouteCoordinates.first {
+                            Marker("Suggested start", coordinate: start)
+                                .tint(.blue)
+                        }
+                    }
+
+                    if hasAlternateStart {
+                        MapPolyline(coordinates: pendingAlternateStartCoordinates)
+                            .stroke(.orange, style: StrokeStyle(lineWidth: 4, dash: [6, 4]))
+
+                        if let start = pendingAlternateStartCoordinates.first {
+                            Marker("Other start", coordinate: start)
+                                .tint(.orange)
+                        }
+                    }
+                }
+                .navigationTitle("Choose your starting path")
+                .navigationBarTitleDisplayMode(.inline)
+                .safeAreaInset(edge: .bottom) {
+                    VStack(spacing: 10) {
+                        Text("Choose the route that starts on your walkway.")
+                            .font(.subheadline)
+
+                        Button("Use Suggested Start") {
+                            shouldOpenARAfterStartReview = true
+                            isShowingStartConfirmation = false
+                        }
+                        .buttonStyle(.borderedProminent)
+
+                        if hasAlternateStart {
+                            Button("Use Other Start") {
+                                arRouteCoordinates = pendingAlternateStartCoordinates
+                                activeRouteStartDiagnostic = "Other start selected on the map."
+                                shouldOpenARAfterStartReview = true
+                                isShowingStartConfirmation = false
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity)
+                    .background(.regularMaterial)
+                }
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") {
+                            isShowingStartConfirmation = false
+                        }
+                    }
+                }
+            }
+        }
         // changes screen when ar navigation is true
         .fullScreenCover(isPresented: $isShowingARNavigarion) {
             if let destination = selectedDestination, let location = arStartLocation {
-                ARNavigationView(destinationName: destination.name, routeCoordinates: arRouteCoordinates, startLocation: location, locationManger: locationManger, rerouteMessage: arRerouteMessage, onReroute: {recalculateActiveRoute(to: destination)})
+                ARNavigationView(destinationName: destination.name, routeCoordinates: arRouteCoordinates, startLocation: location, locationManger: locationManger, rerouteMessage: arRerouteMessage, routeStartDiagnostic: activeRouteStartDiagnostic, onReroute: {recalculateActiveRoute(to: destination)})
                     .id(arRouteSessionID)
             }
         }

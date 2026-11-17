@@ -15,11 +15,13 @@ struct ARNavigationView: View {
     let startLocation: CLLocation
     let locationManger: LocationManager
     let rerouteMessage: String?
+    let routeStartDiagnostic: String
     let onReroute: () -> Bool
     @State private var trackingMessage = "Starting AR tracking…"
     @State private var isShowingRouteMap = false
     @State private var routeMapHeading: Double = 0
     @State private var lastUsableMapProgress: Double?
+    @State private var mapOpenedAutomatically = false
     
     @State private var surfaceCheckCount = 0
     @State private var alignmentRequestCount = 0
@@ -31,6 +33,7 @@ struct ARNavigationView: View {
     @State private var lastGPSFixTimestamp: Date?
     @State private var consecutiveOffRouteGPSFixes = 0
     @State private var lastRerouteAttempt: Date?
+    @State private var hasArrived = false
     
     @Environment(\.dismiss) private var dismiss
     
@@ -116,7 +119,7 @@ struct ARNavigationView: View {
             return false
         }
         
-        return match.distance <= 3
+        return match.distance <= 5
     }
     
     private var hasConfirmedRouteDeviation: Bool {
@@ -167,6 +170,47 @@ struct ARNavigationView: View {
         return []
     }
     
+    private var totalRouteMeters: Double? {
+        guard let origin = routeCoordinates.first, routeCoordinates.count >= 2 else {
+            return nil
+        }
+        
+        let points = routeCoordinates.map { LocalRoutePoint.from(coordinate: $0, relativeTo: origin)}
+        var totalMeters = 0.0
+        
+        for (start, end) in zip(points, points.dropFirst()) {
+            totalMeters += hypot(end.eastMeters - start.eastMeters, end.northMeters - start.northMeters)
+        }
+        return totalMeters
+    }
+    
+    private var remainingRouteMeters: Double? {
+        guard let totalMeters = totalRouteMeters else {return nil}
+        let progress = lastUsableMapProgress ?? 0
+        return max(0, totalMeters - progress)
+    }
+    
+    private var meetsArrivalConditions: Bool {
+        guard let endpoint = routeCoordinates.last,
+              let fix = locationManger.currentLocation,
+              let match = gpsRouteMatch,
+              let totalMeters = totalRouteMeters else {
+            return false
+        }
+        
+        // Require a recent fix before declaring arrival.
+        let age = Date().timeIntervalSince(fix.timestamp)
+        guard age >= -5, age <= 5 else { return false }
+        
+        let destinationLocation = CLLocation(latitude: endpoint.latitude, longitude: endpoint.longitude)
+        
+        // Check Both physical distance and distance left along route
+        let distanceToEndpoint = fix.distance(from: destinationLocation)
+        let metersLeftOnRoute = max(0, totalMeters - match.progress)
+        
+        return distanceToEndpoint <= 8 && metersLeftOnRoute <= 10
+    }
+    
     private func updateGPSDeviationEvidence() {
         guard let location = locationManger.currentLocation,
               let match = gpsRouteMatch else {
@@ -215,6 +259,88 @@ struct ARNavigationView: View {
         
     }
     
+    private func summaryBox<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(spacing: 4) {
+            content()
+                .font(.headline)
+            Text(title)
+                .font(.caption)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .padding(.horizontal, 4)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
+    }
+    
+    // Navigation summary
+    @ViewBuilder
+    private var navigationSummary: some View {
+        if hasArrived {
+            VStack(spacing: 8) {
+                Text("You’ve arrived")
+                    .font(.headline)
+
+                Text(destinationName)
+                
+                Button("End Navigation") {
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(12)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        } else if let meters = remainingRouteMeters {
+            let secondsRemaining = meters / 1.4
+            let minutesRemaining = Int(ceil(secondsRemaining / 60))
+            let estimatedArrival = Date().addingTimeInterval(secondsRemaining)
+            VStack {
+                HStack(spacing: 8) {
+                    summaryBox("Distance left") {
+                        Text("\(meters, specifier: "%.0f") m")
+                    }
+
+                    summaryBox("Time left") {
+                        Text("\(minutesRemaining) min")
+                    }
+
+                    summaryBox("Est. arrival") {
+                        Text(estimatedArrival.formatted(date: .omitted, time: .shortened))
+                    }
+                }
+                .padding(.horizontal, 8)
+                
+                if hasConfirmedRouteDeviation {
+                    Text("GPS indicates you’ve left the route.")
+                        .foregroundStyle(.white)
+                        .padding(8)
+                        .background(
+                            .ultraThinMaterial,
+                            in: RoundedRectangle(cornerRadius: 12)
+                        )
+                }
+                if let rerouteMessage {
+                    Text(rerouteMessage)
+                        .foregroundStyle(.white)
+                        .padding(8)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+            }
+        }
+    }
+    
+    private var arGuidanceAvailable: Bool? {
+        // Wait until the route has been placed. Stop switching after arrival.
+        guard detectedSurfacePoint != nil, !hasArrived else {
+            return nil
+        }
+
+        return routeProgressMeters != nil
+    }
+    
     var body: some View {
         ZStack {
             // Displays the AR Camera
@@ -244,6 +370,7 @@ struct ARNavigationView: View {
                     Menu {
                         // Option to view Map
                         Button("View Map") {
+                            mapOpenedAutomatically = false
                             isShowingRouteMap = true
                         }
                         // Option to exit navigation
@@ -263,22 +390,12 @@ struct ARNavigationView: View {
                     
                     
                 }
-                if hasConfirmedRouteDeviation {
-                    Text("GPS indicates you’ve left the route.")
-                        .foregroundStyle(.white)
-                        .padding(8)
-                        .background(
-                            .ultraThinMaterial,
-                            in: RoundedRectangle(cornerRadius: 12)
-                        )
-                }
-                if let rerouteMessage {
-                    Text(rerouteMessage)
-                        .foregroundStyle(.white)
-                        .padding(8)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-                }
+                
+                navigationSummary
                 Spacer()
+                
+                #if DEBUG
+                /*
                 if let progress = routeProgressMeters {
                     Text("Route progress: \(progress, specifier: "%.1f") m")
                             .foregroundStyle(.white)
@@ -290,8 +407,14 @@ struct ARNavigationView: View {
                 } else {
                     Text("Waiting for route progress…")
                             .foregroundStyle(.white)
-                }
-                #if DEBUG
+                }*/
+                
+                Text(routeStartDiagnostic)
+                    .font(.footnote)
+                    .foregroundStyle(.white)
+                    .padding(8)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                
                 TimelineView(.periodic(from: .now, by: 1)) { timeline in
                     VStack(spacing: 4) {
                         if let fix = locationManger.currentLocation {
@@ -311,13 +434,14 @@ struct ARNavigationView: View {
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
                 
-                
+                /*
                 if let distance = distanceFromRouteMeters {
                     Text("Distance from AR route: \(distance, specifier: "%.1f") m")
                         .foregroundStyle(.white)
                         .padding(8)
                         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
+                
                 if let gpsMatch = gpsRouteMatch {
                     Text("GPS route progress: \(gpsMatch.progress, specifier: "%.1f") m")
                         .foregroundStyle(.white)
@@ -333,6 +457,7 @@ struct ARNavigationView: View {
                     Text("Waiting for a usable GPS location…")
                         .foregroundStyle(.white)
                 }
+                 */
                 // Checks for horizontal surface
                 Button("Check surface") {
                     surfaceCheckCount += 1
@@ -345,7 +470,7 @@ struct ARNavigationView: View {
                     alignmentRequestCount += 1
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(detectedSurfacePoint == nil || routeProgressMeters == nil)
+                .disabled(detectedSurfacePoint == nil )
                 
                 Text(surfaceMessage)
                     .foregroundStyle(.white)
@@ -355,12 +480,45 @@ struct ARNavigationView: View {
             }
             .padding()
         }
+        .task(id: arGuidanceAvailable) {
+            guard let guidanceAvailable = arGuidanceAvailable else { return }
+
+            do {
+                if guidanceAvailable {
+                    guard isShowingRouteMap, mapOpenedAutomatically else { return }
+
+                    try await Task.sleep(for: .seconds(3))
+
+                    guard !Task.isCancelled, arGuidanceAvailable == true,
+                          isShowingRouteMap, mapOpenedAutomatically else { return }
+
+                    isShowingRouteMap = false
+                } else {
+                    guard !isShowingRouteMap else { return }
+
+                    try await Task.sleep(for: .seconds(5))
+
+                    guard !Task.isCancelled, arGuidanceAvailable == false,
+                          !isShowingRouteMap else { return }
+
+                    mapOpenedAutomatically = true
+                    isShowingRouteMap = true
+                }
+            } catch {
+                // Task.sleep throws when canceled. End this timer here.
+            }
+        }
+        .onChange(of: isShowingRouteMap) { _, isShowing in
+            if !isShowing {
+                mapOpenedAutomatically = false
+            }
+        }
         // Shows Map when users Clicks on View Map
         .sheet(isPresented: $isShowingRouteMap) {
             NavigationStack {
                 
                 let remainingCoordinates = remainingMapRouteCoordinates
-                Map(initialPosition: .automatic) {
+                Map(initialPosition: .automatic, bounds: MapCameraBounds(minimumDistance: 150)) {
                     UserAnnotation {
                         ZStack {
                             if let heading = locationManger.headingDegrees {
@@ -387,6 +545,10 @@ struct ARNavigationView: View {
                         Marker(destinationName, coordinate: endpoint)
                     }
                 }
+                .safeAreaInset(edge: .bottom) {
+                    navigationSummary
+                        .padding()
+                }
                 .onMapCameraChange(frequency: .continuous) { context in
                     routeMapHeading = context.camera.heading
                 }
@@ -405,6 +567,11 @@ struct ARNavigationView: View {
             if let match = gpsRouteMatch {
                 lastUsableMapProgress = match.progress
             }
+            if !hasArrived && meetsArrivalConditions {
+                hasArrived = true
+            }
+            guard !hasArrived else {return}
+            
             updateGPSDeviationEvidence()
             rerouteIfNeeded()
         }
