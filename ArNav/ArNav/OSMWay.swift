@@ -1,11 +1,4 @@
-//
-//  OSMWay.swift
-//  ArNav
-//
-//  Created by Franklyn Adu-Baah on 10/22/26.
-//
-
-// defines the information in The OSMWay type
+/// An OSM way retaining its ordered node references and tags.
 struct OSMWay {
     let id: String
     let nodeIDs: [String]

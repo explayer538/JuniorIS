@@ -1,11 +1,4 @@
-//
-//  WalkingEdge.swift
-//  ArNav
-//
-//  Created by Franklyn Adu-Baah on 10/22/26.
-//
-
-// creates the structure for walking edges
+/// A directed walking-network connection with its geographic length in meters.
 struct WalkingEdge {
     let wayID: String
     let fromNodeID: String
